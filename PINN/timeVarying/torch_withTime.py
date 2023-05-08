@@ -229,7 +229,7 @@ if os.path.isfile('./distance_time.pth'):
 model_dist.to(device)
 optimizer_dist = torch.optim.Adam(model_dist.parameters(),lr=8e-4)
 
-for i in range(50):
+for i in range(500):
     running_loss=0.0
     for _, [xyt_dist,dist,ic] in enumerate(train_loader_dist):
         optimizer_dist.zero_grad()
@@ -354,7 +354,7 @@ model_uv.to(device)
 train_loader = torch.utils.data.DataLoader(XYT, batch_size=32,shuffle=True)
 optimizer_uv = torch.optim.Adam(model_uv.parameters(),lr=1e-4)
 
-for i in range(10):
+for i in range(500):
     running_loss=0.0
     loss_plate_stress=0.0 
     loss_plate_uv=0.0

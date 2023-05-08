@@ -1,4 +1,3 @@
-
 import numpy as np
 import os
 import time
@@ -13,12 +12,14 @@ if platform.system()=='Windows':
 import matplotlib.pyplot as plt
 import pandas as pd
 import shutil
-import pickle
 import math
-import scipy.io
-from PIL import Image
+
 import matplotlib.pyplot as plt
 import csv
+from torch.autograd import Variable
+
+from torch.optim import Adam, LBFGS
+from torch.utils.data import Dataset, DataLoader
 
 
 import torch
@@ -26,9 +27,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
-
+from scipy.interpolate import make_interp_spline
 path_fem='./platehole_data.csv'
 matplotlib.rc('font', size=8)
+
+
+E = 20.0
+mu = 0.25
+rho = 1.0
+hole_r = 0.1
+PI = math.pi
 
 #### Creating distance Modelwith Pytorch
 
@@ -87,30 +95,6 @@ class ANN_PartModel(nn.Module):
 
 #### Creating Modelwith Pytorch
 
-class ANN_UvModel(nn.Module):
-    def __init__(self, N_INPUT=2, N_OUTPUT=5, N_HIDDEN=70, N_LAYERS=8):
-        super().__init__()
-        activation = nn.Tanh
-        self.fcs = nn.Sequential(*[
-                        nn.Linear(N_INPUT, N_HIDDEN),
-                        activation()])
-        self.fch = nn.Sequential(*[
-                        nn.Sequential(*[
-                            nn.Linear(N_HIDDEN, N_HIDDEN),
-                            activation()]) for _ in range(N_LAYERS-1)])
-        self.fce = nn.Linear(N_HIDDEN, N_OUTPUT)
-        self.apply(self._init_weights)
-    def _init_weights(self, module):
-      if isinstance(module, nn.Linear):
-          nn.init.xavier_normal_(module.weight)
-          if module.bias is not None:
-              module.bias.data.zero_()
-                
-    def forward(self, x):
-        x = self.fcs(x)
-        x = self.fch(x)
-        x = self.fce(x)
-        return x
 
 def GenDistPt(xmin, xmax, ymin, ymax, xc, yc, r, num_surf_pt, num):
     # num: number per edge
@@ -167,15 +151,7 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print('Current cuda device: ',torch.cuda.get_device_name(0))
 
 
-E = 20.0
-mu = 0.25
-rho = 1.0
-hole_r = 0.1
-#### Note: The detailed description for this case can be found in paper:
-#### Physics informed deep learning for computational elastodynamicswithout labeled data.
-#### https://arxiv.org/abs/2006.08472
-#### But network configuration might be slightly different from what is described in paper.
-PI = math.pi
+
 
 # Domain bounds for x, y and t
 lb = np.array([0, 0])
@@ -193,12 +169,12 @@ XY_dist = np.concatenate((x_dist, y_dist), 1)
 XY_dist,DIST = GenDist(XY_dist)
 
 # Collocation point for equation residual
-XY_c = lb + (ub - lb) * lhs(2, 40000)
-XY_c_ref = lb + np.array([0.2, 0.2]) * lhs(2, 20000)  # Refinement for stress concentration
+XY_c = lb + (ub - lb) * lhs(2, 50000)
+XY_c_ref = lb + np.array([0.2, 0.2]) * lhs(2, 25000)  # Refinement for stress concentration
 XY_c = np.concatenate((XY_c, XY_c_ref), 0)
 XY_c = DelHolePT(XY_c, xc=0, yc=0, r=0.1)
 
-xx, yy = GenHoleSurfPT(xc=0, yc=0, r=0.1, N_PT=5000)
+xx, yy = GenHoleSurfPT(xc=0, yc=0, r=0.1, N_PT=8000)
 
 HOLE = np.concatenate((xx, yy), 1)
 LW = np.array([0.1, 0.0]) + np.array([0.4, 0.0]) * lhs(2, 5000)
@@ -206,15 +182,13 @@ UP = np.array([0.0, 0.5]) + np.array([0.5, 0.0]) * lhs(2, 5000)
 LF = np.array([0.0, 0.1]) + np.array([0.0, 0.4]) * lhs(2, 5000)
 RT = np.array([0.5, 0.0]) + np.array([0.0, 0.5]) * lhs(2, 8000)
 
-# t_RT = RT[:, 2:3]
-# period = 5  # two period in 10s
-# s11_RT = 0.5 * np.sin((2 * PI / period) * t_RT + 3 * PI / 2) + 0.5
+
 s11_RT=np.ones(RT[:,0:1].shape)
 RT = np.concatenate((RT, s11_RT), 1)
 
 # Add some boundary points into the collocation point set
 
-XY_c = np.concatenate((XY_c, HOLE[::1, :], LF[::5, :], RT[::5, 0:2], UP[::5, :], LW[::5, :]), 0)
+XY_c = np.concatenate((XY_c, HOLE[::1, :], LF[::2, :], RT[::2, 0:2], UP[::2, :], LW[::2, :]), 0)
 
 xx, yy = GenHoleSurfPT(xc=0, yc=0, r=0.1, N_PT=XY_c.shape[0])
 
@@ -245,7 +219,7 @@ if os.path.isfile('./distance.pth'):
 optimizer_dist = torch.optim.Adam(model_dist.parameters(),lr=1e-3)
 minLoss=model_acc_dist
 bestModelAt=0
-for i in range(20000):
+for i in range(5000):
     optimizer_dist.zero_grad()
     XY_dist=XY_dist.to(device)
     DIST=DIST.to(device)
@@ -286,14 +260,9 @@ if os.path.isfile('./part.pth'):
     model_part.load_state_dict(torch.load('./part.pth'))
 model_part.to(device)
 optimizer_part = torch.optim.Adam(model_part.parameters(),lr=1e-3)
-# minLoss=  torch.mean((model_part(LF)[:,0])**2)+torch.mean((model_part(LF)[:,1])**2)\
-#          +torch.mean((model_part(UP)[:,3])**2)+torch.mean((model_part(UP)[:,4])**2)\
-#          +torch.mean((model_part(LW)[:,3])**2)+torch.mean((model_part(LW)[:,4])**2)\
-#          +torch.mean((model_part(RT[:,0:2])[:,4])**2)\
-#          +torch.mean((model_part(RT[:,0:2])[:,2]-RT[:,2])**2)
 minLoss=model_acc_part
 bestModelAt=0
-for i in range(20000):
+for i in range(5000):
     optimizer_part.zero_grad()
 
     #LF
@@ -339,47 +308,23 @@ print(f"Best model at {bestModelAt} with loss: {minLoss}")
 # torch.save(model_part.state_dict(), "./part_paper.pth")
 # train standard neural network to fit distance training data
 
-torch.manual_seed(123)
-model_uv = ANN_UvModel()
-if os.path.isfile('./uv.pth'):
-    print("Loading UV...")
-    model_uv.load_state_dict(torch.load('./uv.pth'))
-
-model_uv.to(device)
-
-
-class Build_Data(Dataset):
-    # Constructor
-    def __init__(self):
-        self.x = XY
-        self.y = HOLE
-        self.len = self.x.shape[0]
-    # Getting the data
-    def __getitem__(self, index):
-        return self.x[index], self.y[index]
-    # Getting length of the data
-    def __len__(self):
-        return self.len
+class ANN_UvModel(nn.Module):
+    def __init__(self, N_INPUT=2, N_OUTPUT=5, N_HIDDEN=70, N_LAYERS=8):
+        super().__init__()
+        activation = nn.Tanh
+        self.optim = None
+        
+        self.fcs = nn.Sequential(*[
+                        nn.Linear(N_INPUT, N_HIDDEN),
+                        activation()])
+        self.fch = nn.Sequential(*[
+                        nn.Sequential(*[
+                            nn.Linear(N_HIDDEN, N_HIDDEN),
+                            activation()]) for _ in range(N_LAYERS-1)])
+        self.fce = nn.Linear(N_HIDDEN, N_OUTPUT)
+        self.apply(self._init_weights)
     
-train = Build_Data()
-train_loader = DataLoader(train, batch_size=128,shuffle=True)
-optimizer_uv = torch.optim.Adam(model_uv.parameters(),lr=1e-4)
-
-for i in range(10):
-    
-    running_loss=0.0
-    loss_hole=0.0
-    loss_plate_stress=0.0 
-    loss_plate_uv=0.0
-    for _, [xy,hole] in enumerate(train_loader):
-
-        optimizer_uv.zero_grad()
-    
-
-        xy=xy.to(device)
-        yh = model_uv(xy)
-        yh=yh*model_dist(xy)+model_part(xy)
-
+    def lossFct(self,xy,hole,yh):
         e11=torch.autograd.grad(yh[:,0], xy,torch.ones_like(yh[:,0]), create_graph=True)[0][:,0]# computes dy/dx
         e12=torch.autograd.grad(yh[:,0], xy,torch.ones_like(yh[:,0]), create_graph=True)[0][:,1]
         e22=torch.autograd.grad(yh[:,1], xy,torch.ones_like(yh[:,1]), create_graph=True)[0][:,1]# computes dy/dx
@@ -408,40 +353,136 @@ for i in range(10):
         loss3=torch.mean(f_u**2)+torch.mean(f_v**2)
     ## For hole 
 
-        hole=hole.to(device)
+        # hole=hole.to(device)
         r = hole_r
         nx = -hole[:,0] / r
         ny = -hole[:,1] / r
-        yh_hole = model_uv(hole)
+        yh_hole = self(hole)
         yh_hole=yh_hole*model_dist(hole)+model_part(hole)
         tx=torch.mul(yh_hole[:,2],nx)+torch.mul(yh_hole[:,4],ny)
         ty=torch.mul(yh_hole[:,4],nx)+torch.mul(yh_hole[:,3],ny)
-    # tx=yh[:,2]*nx+yh[:,4]*ny
-    # ty=yh[:,4]*nx+yh[:,3]*ny
         loss2=torch.mean(tx**2)+torch.mean(ty**2)
+        loss = loss1+loss2+loss3# add two loss terms together 
+        return loss
     
-    # backpropagate joint loss
-    # loss=loss1
-        loss = loss1 + loss2+loss3# add two loss terms together 
-        loss=10*loss
-        loss.backward()
-        optimizer_uv.step()
-        running_loss+=loss.item()
-        loss_hole+=loss2.item()
-        loss_plate_stress+=loss1.item()
-        loss_plate_uv+=loss3.item()
-        if _%100==99: 
-            print("plate loss stress: ",loss_plate_stress/100,"plate loss uv: ",loss_plate_uv/100,"  hole loss: ", loss_hole/100)
-            torch.save(model_uv.state_dict(), "./uv.pth")
-            print('[%d, %5d] loss: %.4f' %
-                (i + 1, _ + 1, running_loss / 100))
-            running_loss = 0.0
-            loss_hole = 0.0
-            loss_plate_stress = 0.0
-            loss_plate_uv=0.0
+
+    def _init_weights(self, module):
+      if isinstance(module, nn.Linear):
+          nn.init.xavier_normal_(module.weight)
+          if module.bias is not None:
+              module.bias.data.zero_()
+                
+    def forward(self, x):
+        x = self.fcs(x)
+        x = self.fch(x)
+        x = self.fce(x)
+        return x
+    
+    def train(self, data_loader, epochs, validation_data=None):
+        for epoch in range(epochs):
+            running_loss,batches = self._train_iteration(data_loader)
+            val_loss = None
+            
+            if validation_data is not None:
+                y_hat = self(validation_data['X'])
+                val_loss = self.lossFct(input=y_hat, target=validation_data['y']).detach().numpy()
+                print('[%d] loss: %.3f | validation loss: %.3f' %
+                (epoch + 1, running_loss, val_loss))
+            else:
+                torch.save(self.state_dict(), "./uv.pth")
+                print('[%d] loss: %.6f' %
+                (epoch + 1, running_loss/batches))
+            
+            
+                
+    def _train_iteration(self,data_loader):
+        running_loss = 0.0
+        batches=0
+        for i, (X,hole) in enumerate(data_loader):
+            batches=batches+1
+            X=X.to(device)
+            hole=hole.to(device)
+            X = X.float()
+            hole = hole.float()
+            X_ = Variable(X, requires_grad=True)
+            hole=Variable(hole, requires_grad=True)
+
+            def closure():
+                if torch.is_grad_enabled():
+                    self.optim.zero_grad()
+                output = self(X_)*model_dist(X_)+model_part(X_)
+                loss = self.lossFct(X_, hole,output)
+                if loss.requires_grad:
+                    # print('loss backward')
+                    loss.backward()
+                return loss
+            
+            self.optim.step(closure)
+            
+            # calculate the loss again for monitoring
+            output = self(X_)*model_dist(X_)+model_part(X_)
+            loss = closure()
+            running_loss += loss.item()
+            # if(i%100==99):
+            #     print('loss(i%100): ', loss.item())
+        return running_loss,batches
+    
+    # I like to include a sklearn like predict method for convenience
+    def predict(self, X):
+        X_ = torch.Tensor(X)
+        return (self(X_)*model_dist(X_)+model_part(X_)).detach().numpy().squeeze()
 
 
-    
+class Build_Data(Dataset):
+    # Constructor
+    def __init__(self):
+        self.x = XY
+        self.y = HOLE
+        self.len = self.x.shape[0]
+    # Getting the data
+    def __getitem__(self, index):
+        return self.x[index], self.y[index]
+    # Getting length of the data
+    def __len__(self):
+        return self.len
+
+#Adam 1.0
+model_uv = ANN_UvModel()
+if os.path.isfile('./uv.pth'):
+    print("Loading UV...")
+    model_uv.load_state_dict(torch.load('./uv.pth'))
+model_uv.to(device)
+train = Build_Data()
+train_loader = DataLoader(train, batch_size=128,shuffle=True)
+model_uv.optim = Adam(model_uv.parameters(), lr=1e-3)
+EPOCHS=100
+model_uv.train(train_loader,EPOCHS)
+
+#Adam 2.0
+model_uv = ANN_UvModel()
+if os.path.isfile('./uv.pth'):
+    print("Loading UV...")
+    model_uv.load_state_dict(torch.load('./uv.pth'))
+model_uv.to(device)
+train = Build_Data()
+train_loader = DataLoader(train, batch_size=128,shuffle=True)
+model_uv.optim = Adam(model_uv.parameters(), lr=5e-4)
+EPOCHS=20
+model_uv.train(train_loader,EPOCHS)
+
+# LFBGS
+train = Build_Data()
+train_loader = DataLoader(train, batch_size=XY.shape[0],shuffle=True)
+
+model_uv = ANN_UvModel()
+if os.path.isfile('./uv.pth'):
+    print("Loading UV...")
+    model_uv.load_state_dict(torch.load('./uv.pth'))
+
+model_uv.to(device)
+model_uv.optim = LBFGS(model_uv.parameters(), history_size=20, max_iter=1000,lr=0.1)
+EPOCHS=1000
+model_uv.train(train_loader,EPOCHS)
 # torch.save(model_uv.state_dict(), "./uv_paper.pth")
 def newPostProcess(field):
     x_pred, y_pred, u_pred, v_pred, s11_pred, s22_pred, s12_pred = field
@@ -472,33 +513,33 @@ def FEMcomparisionUV(xy, y_predicted, uv_fem, scale=1, s=5):
     v_error= v_error.cpu().detach().numpy()
 
     cf= ax[0,0].scatter(x_pred , y_pred, c=u_pred, alpha=0.7, edgecolors='none',
-                          cmap='rainbow', marker='o', s=s,vmin=0, vmax=0.03)
+                          cmap='rainbow', marker='o', s=s)
     ax[0, 0].set_title(r'$u$-PINN', fontsize=8)
     cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[0, 0])
     
     cf=ax[1,0].scatter(x_pred, y_pred, c=u_fem, alpha=0.7, edgecolors='none',
-                        cmap='rainbow', marker='o', s=s,vmin=0, vmax=0.03)
+                        cmap='rainbow', marker='o', s=s)
     ax[1, 0].set_title(r'$u$-FEM', fontsize=8)
     cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[1, 0])
     
     cf=ax[2,0].scatter(x_pred, y_pred, c=u_error, alpha=0.7, edgecolors='none',
-                    cmap='rainbow', marker='o', s=s,vmin=0, vmax=0.03)
+                    cmap='rainbow', marker='o', s=s)
     
     ax[2, 0].set_title(r'$u$-error', fontsize=8)
     cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[2, 0])
 
     cf= ax[0,1].scatter(x_pred, y_pred, c=v_pred, alpha=0.7, edgecolors='none',
-                          cmap='rainbow', marker='o', s=s, vmin=-0.01, vmax=0)
+                          cmap='rainbow', marker='o', s=s)
     ax[0, 1].set_title(r'$v$-PINN', fontsize=8)
     cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[0, 1])
     
     cf=ax[1,1].scatter(x_pred, y_pred, c=v_fem, alpha=0.7, edgecolors='none',
-                        cmap='rainbow', marker='o', s=s, vmin=-0.01, vmax=0)
+                        cmap='rainbow', marker='o', s=s)
     ax[1, 1].set_title(r'$v$-FEM', fontsize=8)
     cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[1, 1])
     
     cf=ax[2,1].scatter(x_pred, y_pred, c=v_error, alpha=0.7, edgecolors='none',
-                    cmap='rainbow', marker='o', s=s,vmin=-0.01, vmax=0)
+                    cmap='rainbow', marker='o', s=s)
     
     ax[2, 1].set_title(r'$v$-error', fontsize=8)
     cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[2, 1])
@@ -536,21 +577,21 @@ def FEMcomparisionStr(xy, s_predicted, s_fem, scale=1, s=5):
     lblsz=8
 
     cf= ax[0,0].scatter(x_pred , y_pred , c=s11_pred, alpha=0.7, edgecolors='none',
-                          cmap='rainbow', marker='o', s=s, vmin=0, vmax=2.6)
+                          cmap='rainbow', marker='o', s=s)
     ax[0,0].axis('square')
     ax[0, 0].set_title(r'$s11$-PINN', fontsize=8)
     cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[0, 0])
     cbar.ax.tick_params(labelsize=lblsz)
     
     cf=ax[1,0].scatter(x_pred, y_pred, c=s11_fem, alpha=0.7, edgecolors='none',
-                        cmap='rainbow', marker='o', s=s, vmin=0, vmax=2.6)
+                        cmap='rainbow', marker='o', s=s)
     ax[1,0].axis('square')
     ax[1, 0].set_title(r'$s11$-FEM', fontsize=8)
     cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[1, 0])
     cbar.ax.tick_params(labelsize=lblsz)
     
     cf=ax[2,0].scatter(x_pred , y_pred, c=s11_error, alpha=0.7, edgecolors='none',
-                    cmap='rainbow', marker='o', s=s, vmin=0, vmax=2.6)
+                    cmap='rainbow', marker='o', s=s)
     ax[2,0].axis('square')
     
     ax[2, 0].set_title(r'$s11$-error', fontsize=8)
@@ -559,21 +600,21 @@ def FEMcomparisionStr(xy, s_predicted, s_fem, scale=1, s=5):
 
 
     cf= ax[0,1].scatter(x_pred , y_pred , c=s12_pred, alpha=0.7, edgecolors='none',
-                          cmap='rainbow', marker='o', s=s, vmin=-0.1, vmax=0.1)
+                          cmap='rainbow', marker='o', s=s)
     ax[0,1].axis('square')
     ax[0, 1].set_title(r'$s12$-PINN', fontsize=8)
     cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[0, 1])
     cbar.ax.tick_params(labelsize=lblsz)
     
     cf=ax[1,1].scatter(x_pred, y_pred, c=s12_fem, alpha=0.7, edgecolors='none',
-                        cmap='rainbow', marker='o', s=s, vmin=-0.1, vmax=0.1)
+                        cmap='rainbow', marker='o', s=s)
     ax[1,1].axis('square')
     ax[1, 1].set_title(r'$s12$-FEM', fontsize=8)
     cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[1, 1])
     cbar.ax.tick_params(labelsize=lblsz)
     
     cf=ax[2,1].scatter(x_pred , y_pred, c=s12_error, alpha=0.7, edgecolors='none',
-                    cmap='rainbow', marker='o', s=s, vmin=-0.1, vmax=0.1)
+                    cmap='rainbow', marker='o', s=s)
     ax[2,1].axis('square')
     
     ax[2, 1].set_title(r'$s12$-error', fontsize=8)
@@ -583,21 +624,21 @@ def FEMcomparisionStr(xy, s_predicted, s_fem, scale=1, s=5):
 
 
     cf= ax[0,2].scatter(x_pred , y_pred , c=s22_pred, alpha=0.7, edgecolors='none',
-                          cmap='rainbow', marker='o', s=s,vmin=-1, vmax=0.5)
+                          cmap='rainbow', marker='o', s=s)
     ax[0,2].axis('square')
     ax[0, 2].set_title(r'$s22$-PINN', fontsize=8)
     cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[0, 2])
     cbar.ax.tick_params(labelsize=lblsz)
     
     cf=ax[1,2].scatter(x_pred, y_pred, c=s22_fem, alpha=0.7, edgecolors='none',
-                        cmap='rainbow', marker='o', s=s,vmin=-1, vmax=0.5)
+                        cmap='rainbow', marker='o', s=s)
     ax[1,2].axis('square')
     ax[1, 2].set_title(r'$s22$-FEM', fontsize=8)
     cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[1, 2])
     cbar.ax.tick_params(labelsize=lblsz)
     
     cf=ax[2,2].scatter(x_pred , y_pred, c=s22_error, alpha=0.7, edgecolors='none',
-                    cmap='rainbow', marker='o',vmin=-1, vmax=0.5)
+                    cmap='rainbow', marker='o')
     ax[2,2].axis('square')
     ax[2, 2].set_title(r'$s22$-error', fontsize=8)
     cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[2, 2])
@@ -605,6 +646,169 @@ def FEMcomparisionStr(xy, s_predicted, s_fem, scale=1, s=5):
 
     plt.savefig('./output/stress_comparison'+ '.png', dpi=200)
     plt.close('all')
+
+def FEMcomparisionUV1(xy, y_predicted, uv_fem, scale=1, s=5):
+    x_pred=xy[:,0]
+    y_pred=xy[:,1]
+    u_pred=y_predicted[:,0]
+    v_pred=y_predicted[:,1]
+    u_fem=uv_fem[:,0]
+    v_fem=uv_fem[:,1]
+    u_error=u_pred-u_fem
+    v_error=v_pred-v_fem
+    fig, ax = plt.subplots(nrows=2, ncols=3, figsize=(9, 6))
+    fig.subplots_adjust(hspace=0.3, wspace=0.3)
+    fig.tight_layout(pad=4.0)
+    x_pred= x_pred.cpu().detach().numpy()
+    y_pred= y_pred.cpu().detach().numpy()
+    u_pred= u_pred.cpu().detach().numpy()
+    v_pred= v_pred.cpu().detach().numpy()
+    u_fem= u_fem.cpu().detach().numpy()
+    v_fem= v_fem.cpu().detach().numpy()
+    u_error= u_error.cpu().detach().numpy()
+    v_error= v_error.cpu().detach().numpy()
+
+    cf= ax[0,0].scatter(x_pred , y_pred, c=u_pred, alpha=0.7, edgecolors='none',
+                          cmap='rainbow', marker='o', s=s)
+    ax[0,0].axis('square')
+    ax[0, 0].set_title(r'$u$-PINN', fontsize=8)
+    cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[0, 0])
+    cbar.ax.set_title(r'$(m)$')
+    cf=ax[0,1].scatter(x_pred, y_pred, c=u_fem, alpha=0.7, edgecolors='none',
+                        cmap='rainbow', marker='o', s=s)
+    ax[0,1].axis('square')
+    ax[0, 1].set_title(r'$u$-FEM', fontsize=8)
+    cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[0, 1])
+    cbar.ax.set_title(r'$(m)$')
+    cf=ax[0, 2].scatter(x_pred, y_pred, c=u_error, alpha=0.7, edgecolors='none',
+                    cmap='rainbow', marker='o', s=s,vmin=u_fem.min(),vmax=u_fem.max())
+    ax[0,2].axis('square')
+    ax[0, 2].set_title(r'$u$-error', fontsize=8)
+    cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[0, 2])
+    cbar.ax.set_title(r'$(m)$')
+    cf= ax[1, 0].scatter(x_pred, y_pred, c=v_pred, alpha=0.7, edgecolors='none',
+                          cmap='rainbow', marker='o', s=s)
+    ax[1,0].axis('square')
+    ax[1, 0].set_title(r'$v$-PINN', fontsize=8)
+    cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[1, 0])
+    cbar.ax.set_title(r'$(m)$')
+    cf=ax[1, 1].scatter(x_pred, y_pred, c=v_fem, alpha=0.7, edgecolors='none',
+                        cmap='rainbow', marker='o', s=s)
+    ax[1,1].axis('square')
+    ax[1, 1].set_title(r'$v$-FEM', fontsize=8)
+    cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[1, 1])
+    cbar.ax.set_title(r'$(m)$')
+    cf=ax[1, 2].scatter(x_pred, y_pred, c=v_error, alpha=0.7, edgecolors='none',
+                    cmap='rainbow', marker='o', s=s,vmin=v_fem.min(),vmax=v_fem.max())
+    ax[1,2].axis('square')
+    
+    ax[1, 2].set_title(r'$v$-error', fontsize=8)
+    cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[1, 2])
+    cbar.ax.set_title(r'$(m)$')
+    plt.savefig('./output/uv_comparison_lat'+ '.png', dpi=200)
+    plt.close('all')    
+
+def FEMcomparisionStr1(xy, s_predicted, s_fem, scale=1, s=5):
+    x_pred=xy[:,0]
+    y_pred=xy[:,1]
+    s11_pred=s_predicted[:,0]
+    s12_pred=s_predicted[:,2]
+    s22_pred=s_predicted[:,1]
+    s11_fem=s_fem[:,0]
+    s12_fem=s_fem[:,1]
+    s22_fem=s_fem[:,2]
+    s11_error=s11_pred-s11_fem
+    s12_error=s12_pred-s12_fem
+    s22_error=s22_pred-s22_fem
+
+    fig, ax = plt.subplots(nrows=3, ncols=3, figsize=(9, 9))
+    fig.subplots_adjust(hspace=0.3, wspace=0.3)
+    fig.tight_layout(pad=4.0)
+    x_pred= x_pred.cpu().detach().numpy()
+    y_pred= y_pred.cpu().detach().numpy()
+    s11_pred= s11_pred.cpu().detach().numpy()
+    s12_pred= s12_pred.cpu().detach().numpy()
+    s22_pred= s22_pred.cpu().detach().numpy()
+    s11_fem= s11_fem.cpu().detach().numpy()
+    s12_fem= s12_fem.cpu().detach().numpy()
+    s22_fem= s22_fem.cpu().detach().numpy()
+    s11_error= s11_error.cpu().detach().numpy()
+    s12_error= s12_error.cpu().detach().numpy()
+    s22_error= s22_error.cpu().detach().numpy()
+
+    lblsz=8
+
+    cf= ax[0,0].scatter(x_pred , y_pred , c=s11_pred, alpha=0.7, edgecolors='none',
+                          cmap='rainbow', marker='o', s=s)
+    ax[0,0].axis('square')
+    ax[0,0].set_title(r'$s11$-PINN', fontsize=8)
+    cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[0,0])
+    cbar.ax.tick_params(labelsize=lblsz)
+    cbar.ax.set_title(r'$(M Pa)$')
+    cf=ax[0,1].scatter(x_pred, y_pred, c=s11_fem, alpha=0.7, edgecolors='none',
+                        cmap='rainbow', marker='o', s=s)
+    ax[0,1].axis('square')
+    ax[0,1].set_title(r'$s11$-FEM', fontsize=8)
+    cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[0,1])
+    cbar.ax.tick_params(labelsize=lblsz)
+    cbar.ax.set_title(r'$(M Pa)$')
+    cf=ax[0,2].scatter(x_pred , y_pred, c=s11_error, alpha=0.7, edgecolors='none',
+                    cmap='rainbow', marker='o', s=s,vmin=s11_fem.min(),vmax=s11_fem.max())
+    ax[0,2].axis('square')
+    
+    ax[0,2].set_title(r'$s11$-error', fontsize=8)
+    cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[0,2])
+    cbar.ax.tick_params(labelsize=lblsz)
+    cbar.ax.set_title(r'$(M Pa)$')
+
+    cf= ax[1,0].scatter(x_pred , y_pred , c=s12_pred, alpha=0.7, edgecolors='none',
+                          cmap='rainbow', marker='o', s=s)
+    ax[1,0].axis('square')
+    ax[1,0].set_title(r'$s12$-PINN', fontsize=8)
+    cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[1,0])
+    cbar.ax.tick_params(labelsize=lblsz)
+    cbar.ax.set_title(r'$(M Pa)$')
+    cf=ax[1,1].scatter(x_pred, y_pred, c=s12_fem, alpha=0.7, edgecolors='none',
+                        cmap='rainbow', marker='o', s=s)
+    ax[1,1].axis('square')
+    ax[1,1].set_title(r'$s12$-FEM', fontsize=8)
+    cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[1,1])
+    cbar.ax.tick_params(labelsize=lblsz)
+    cbar.ax.set_title(r'$(M Pa)$')
+    cf=ax[1,2].scatter(x_pred , y_pred, c=s12_error, alpha=0.7, edgecolors='none',
+                    cmap='rainbow', marker='o', s=s,vmin=s12_fem.min(),vmax=s12_fem.max())
+    ax[1,2].axis('square')
+    
+    ax[1,2].set_title(r'$s12$-error', fontsize=8)
+    cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[1,2])
+    cbar.ax.tick_params(labelsize=lblsz)
+    cbar.ax.set_title(r'$(M Pa)$')
+
+
+    cf= ax[2,0].scatter(x_pred , y_pred , c=s22_pred, alpha=0.7, edgecolors='none',
+                          cmap='rainbow', marker='o', s=s)
+    ax[2,0].axis('square')
+    ax[2,0].set_title(r'$s22$-PINN', fontsize=8)
+    cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[2,0])
+    cbar.ax.tick_params(labelsize=lblsz)
+    cbar.ax.set_title(r'$(M Pa)$')
+    cf=ax[2,1].scatter(x_pred, y_pred, c=s22_fem, alpha=0.7, edgecolors='none',
+                        cmap='rainbow', marker='o', s=s)
+    ax[2,1].axis('square')
+    ax[2,1].set_title(r'$s22$-FEM', fontsize=8)
+    cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[2,1])
+    cbar.ax.tick_params(labelsize=lblsz)
+    cbar.ax.set_title(r'$(M Pa)$')
+    cf=ax[2,2].scatter(x_pred , y_pred, c=s22_error, alpha=0.7, edgecolors='none',
+                    cmap='rainbow', marker='o',vmin=s22_fem.min(),vmax=s22_fem.max())
+    ax[2,2].axis('square')
+    ax[2,2].set_title(r'$s22$-error', fontsize=8)
+    cbar = fig.colorbar(cf, fraction=0.046, pad=0.04, ax=ax[2,2])
+    cbar.ax.tick_params(labelsize=lblsz)
+    cbar.ax.set_title(r'$(M Pa)$')
+    plt.savefig('./output/stress_comparison_lat'+ '.png', dpi=200)
+    plt.close('all')
+
 
 def postProcessDef(xmin, xmax, ymin, ymax, field, s=5, num=0, scale=1):
     ''' Plot deformed plate (set scale=0 want to plot undeformed contours)
@@ -746,10 +950,11 @@ my_data = np.genfromtxt(path_fem, delimiter=',')
 csv_data=my_data[1:,:]
 x_col, y_col = 2,3
 u_col, v_col = 0,1
+csv_data[:,[x_col,y_col]]+=0.25
 s11_col, s12_col, s22_col=5,6,8
 
 xy=torch.FloatTensor(csv_data[:,[x_col,y_col]]).requires_grad_(True)
-xy=xy+0.25
+# xy=xy+0.25
 xy=xy.to(device)
 
 ### UV comparision ###
@@ -760,10 +965,8 @@ y_dist=model_dist(xy)
 y_part=model_part(xy)
 y_predicted=y*y_dist+y_part
 y_predicted=y_predicted[:,[0,1]]
-FEMcomparisionUV(xy, y_predicted, uv_fem)
-######
+FEMcomparisionUV1(xy, y_predicted, uv_fem)
 
-### Stress comparision ###
 s_fem=torch.FloatTensor(csv_data[:,[s11_col,s12_col,s22_col]]).requires_grad_(True)
 s_fem=s_fem.to(device)
 y=model_uv(xy)
@@ -771,5 +974,54 @@ y_dist=model_dist(xy)
 y_part=model_part(xy)
 s_predicted=y*y_dist+y_part
 s_predicted=s_predicted[:,[2,3,4]]
-FEMcomparisionStr(xy, s_predicted, s_fem)
-######
+FEMcomparisionStr1(xy, s_predicted, s_fem)
+
+n_pts=len(csv_data)
+pts_on_hole = np.zeros((1,0), dtype= int)
+for i in range(n_pts) :
+    x_pt = csv_data[i][x_col]
+    y_pt = csv_data[i][y_col]
+    if x_pt**2+y_pt**2-0.01>=0.0020 and x_pt**2+y_pt**2-0.01<=0.0025:
+        print(x_pt**2+y_pt**2)
+        pts_on_hole=np.append(pts_on_hole,int(i))
+
+out_names = ["$u/(m)$","$v/(m)$",r"$\sigma_{11}/(M Pa)$",r"$\sigma_{22}/(M Pa)$",r"$\sigma_{12}/(M Pa)$"]
+png_names = ["u","v",r"s11",r"s22",r"s12"]
+def sort_list(list1, list2):
+    zipped_pairs = zip(list2, list1)
+    z = [x for _, x in sorted(zipped_pairs)]
+    return np.array(z)
+
+for i in range(5):
+    fem_hole = csv_data[pts_on_hole,:]
+    xy_hole =  fem_hole[:,[x_col,y_col]]
+    xy_hole = torch.FloatTensor(xy_hole)
+    xy_hole = xy_hole.to(device)
+    y_fem_hole = torch.FloatTensor(fem_hole[:,[u_col,v_col,s11_col,s22_col,s12_col]]).to(device)
+    y_pred_hole = model_part(xy_hole).to(device) + model_dist(xy_hole) * model_uv(xy_hole)
+    # print(y_pred_hole - y_fem_hole)
+    xy_hole=xy_hole.cpu().detach().numpy()
+    theta = np.flip(np.arctan(xy_hole[:,1]/xy_hole[:,0]),0)
+    theta=theta*180/PI
+    vals = np.flip(y_pred_hole.cpu().detach().numpy(),0)
+    fem_vals = np.flip(y_fem_hole.cpu().detach().numpy(),0)
+    vals[:,i]=sort_list(vals[:,i],theta)
+    fem_vals[:,i]=sort_list(fem_vals[:,i],theta)
+    theta=np.sort(theta)
+    X_Y_Spline = make_interp_spline(theta, vals[:,i])
+
+    X_ = np.linspace(0, 90, 500)
+    Y_ = X_Y_Spline(X_)
+
+    # Plotting the Graph
+    # plt.plot(X_, Y_, label =f'PINN')
+    plt.scatter(theta , vals[:,i], label = f'PINN')
+    # plt.scatter(theta, vals[:,i], label = f't = {t}, PINN')
+    plt.scatter(theta , fem_vals[:,i], label = f'FEM')
+    plt.legend()
+    plt.ylabel(out_names[i],fontsize=18)
+    plt.xlabel(r"$\theta/degree$",fontsize=16)
+    plt.xticks(fontsize=12)
+    plt.yticks(fontsize=9)
+    plt.savefig(f'./output/hole_output_{png_names[i]}' + '.png', dpi=200)
+    plt.close('all')
